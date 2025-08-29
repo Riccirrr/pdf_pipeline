@@ -1,0 +1,22 @@
+# ---- core ----
+setuptools>=68,<75
+wheel>=0.43
+numpy==1.26.4
+pandas==2.2.2
+PyMuPDF==1.24.10     # import 名称: fitz
+aiohttp==3.9.5
+tqdm==4.66.4
+pdfminer.six==20231228
+
+# ---- tables ----
+camelot-py==0.11.0
+opencv-python-headless==4.9.0.80
+ghostscript==0.7      # Python 绑定，避免 Camelot 对 gs 的误报
+
+# ---- ocr ----
+shapely==2.0.2
+scipy==1.11.4
+scikit-image==0.21.0
+pillow>=10,<11
+paddlepaddle==2.6.1
+paddleocr==2.7.0.3
