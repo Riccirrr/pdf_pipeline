@@ -297,16 +297,50 @@ def _clean_table_df(df_raw: pd.DataFrame) -> tuple[pd.DataFrame, dict]:
 
     # 4) 数值标准化
     scale = unit_info["scale"] if unit_info else Decimal("1")
-    def _maybe_numeric(v):
+    
+    # 首先识别哪些列主要包含数值数据
+    numeric_columns = set()
+    for col_idx in range(len(df.columns)):
+        col_values = df.iloc[:, col_idx].astype(str).tolist()
+        numeric_count = 0
+        total_non_empty = 0
+        
+        for val in col_values:
+            val_clean = _to_halfwidth(str(val)).strip()
+            if not val_clean or val_clean in {"-", "—", "–", "— —", "--", "N/A", "NA"}:
+                continue
+            total_non_empty += 1
+            # 检查是否包含数字、千分位逗号、括号等数值特征
+            if re.search(r"[0-9\(\),，．.％%]", val_clean):
+                numeric_count += 1
+        
+        # 如果超过50%的非空值包含数值特征，则认为该列为数值列
+        if total_non_empty > 0 and numeric_count / total_non_empty > 0.5:
+            numeric_columns.add(col_idx)
+    
+    def _maybe_numeric(v, col_idx=None):
         if v is None:
             return v
         s = str(v)
-        # 若字符串里含数字或括号/逗号，尝试转数
+        
+        # 如果该列被识别为数值列，优先尝试数值转换
+        if col_idx is not None and col_idx in numeric_columns:
+            # 对于数值列，即使不包含明显数值特征也尝试转换（可能是空白、文本等）
+            converted = _to_number(s, scale)
+            # 如果转换后不是原字符串，说明成功转换为数值
+            if converted != s:
+                return converted
+            # 否则至少进行半角标准化
+            return _to_halfwidth(s)
+        
+        # 非数值列的原有逻辑：若字符串里含数字或括号/逗号，尝试转数
         if re.search(r"[0-9\(\),，．.％%]", s):
             return _to_number(s, scale)
         return _to_halfwidth(s)
 
-    df = df.map(_maybe_numeric)
+    # 按列应用数值转换，传入列索引信息
+    for col_idx, col_name in enumerate(df.columns):
+        df[col_name] = df[col_name].apply(lambda x: _maybe_numeric(x, col_idx))
 
     meta = {
         "unit": unit_info["unit"] if unit_info else None,
@@ -378,8 +412,6 @@ def _extract_tables(pdf_path: Path) -> List[Dict[str, Any]]:
                 "flavor": "lattice",
                 "shape_raw": list(df_raw.shape),
                 "shape_clean": list(df_clean.shape),
-                "preview_raw": df_raw.head(3).values.tolist(),
-                "preview_clean": df_clean.head(3).values.tolist(),
                 "raw_json": df_raw.to_json(orient="split", force_ascii=False),
                 "clean_json": df_clean.to_json(orient="split", force_ascii=False),
                 "meta": meta,
@@ -399,8 +431,6 @@ def _extract_tables(pdf_path: Path) -> List[Dict[str, Any]]:
                 "flavor": "stream",
                 "shape_raw": list(df_raw.shape),
                 "shape_clean": list(df_clean.shape),
-                "preview_raw": df_raw.head(3).values.tolist(),
-                "preview_clean": df_clean.head(3).values.tolist(),
                 "raw_json": df_raw.to_json(orient="split", force_ascii=False),
                 "clean_json": df_clean.to_json(orient="split", force_ascii=False),
                 "meta": meta,
