@@ -214,78 +214,101 @@ def _maybe_merge_multirow_header(df: pd.DataFrame) -> tuple[pd.DataFrame, dict]:
 
     return df, meta
 
-def _to_number(x: str, scale: Decimal) -> str | float:
+# === 替换：精确十进制解析，保留原小数位（避免 float 误差） =================
+_NUM_WITH_GROUPS = re.compile(r"""
+    ^\s*
+    (?P<neg>\(|\-)?               # (  或 - 作为负号
+    (?P<int>\d{1,3}(?:,\d{3})*|\d+)
+    (?:\.(?P<frac>\d+))?          # 小数部分
+    \)?                           # 右括号（若用括号负号）
+    \s*$
+""", re.X)
+
+def _decimal_str_preserve(raw: str, scale: Decimal) -> Optional[str]:
     """
-    将字符串数值标准化：
-      - 去千分位（逗号）
-      - (x) 或 （x） 转负数
-      - 全角标点转半角
-      - 按单位缩放（万元→乘 10000）
-    返回 float（或原串若确实不是数）。
+    将 '74,002,263,778.73' 或 '(11,946.5)' 解析为十进制并应用单位缩放，
+    最终返回 **不带千分位**、**保留原小数位** 的字符串；若非数字返回 None。
     """
-    s = _to_halfwidth(x)
+    s = _to_halfwidth(raw)
     if not s:
-        return s
-    # 纯百分比保留原样（可按需要扩展）
+        return None
+    # 百分比：保持为字符串（不当成金额）
     if s.endswith("%"):
+        return None
+    m = _NUM_WITH_GROUPS.match(s)
+    if not m:
+        # 破折号、空值等
+        if s in {"-", "—", "–", "--", "N/A", "NA"}:
+            return ""
+        return None
+    neg = bool(m.group("neg") and "(" in m.group("neg"))
+    sign_minus = bool(m.group("neg") == "-")
+    negative = neg or sign_minus
+    int_part = m.group("int").replace(",", "")
+    frac_part = m.group("frac") or ""
+    dp = len(frac_part)
+    dec = Decimal(int_part)
+    if dp:
+        dec = dec + (Decimal(int(frac_part)) / (Decimal(10) ** dp))
+    if negative:
+        dec = -dec
+    if scale and scale != 1:
+        dec = dec * scale
+    # 以原小数位数格式化；若经缩放导致需要更多小数位，保留必要位数（不截断）
+    if dp == 0:
+        # 尽量输出整数形式
+        q = dec.quantize(Decimal("1")) if dec == dec.to_integral_value() else dec.normalize()
+        s_out = format(q, "f")
+    else:
+        # 按原 dp 量化；若舍入会改变数值，用 normalize 安全输出
         try:
-            core = s[:-1].replace(",", "")
-            val = Decimal(core)
-            return float(val)  # 也可返回百分比小数：float(val)/100
+            q = dec.quantize(Decimal(1).scaleb(-dp))
+            s_out = format(q, "f")
+        except InvalidOperation:
+            s_out = format(dec.normalize(), "f")
+    return s_out
+
+def _format_pretty(val: Any) -> str:
+    # 可读版：千分位 + 括号负号；同时支持字符串形式的十进制
+    if isinstance(val, (int, float)):
+        return f"({abs(val):,.2f})" if val < 0 else f"{val:,.2f}"
+    if isinstance(val, Decimal):
+        return f"({abs(val):,.2f})" if val < 0 else f"{val:,.2f}"
+    # 传入可能是已经标准化的十进制字符串
+    if isinstance(val, str):
+        s = val.strip()
+        if not s:
+            return ""
+        try:
+            d = Decimal(s)
+            return f"({abs(d):,.2f})" if d < 0 else f"{d:,.2f}"
         except Exception:
-            return s
+            return _to_halfwidth(s)
+    if val in ("", None): return ""
+    return _to_halfwidth(str(val))
 
-    neg = False
-    # 括号负数
-    if (s.startswith("(") and s.endswith(")")) or (s.startswith("（") and s.endswith("）")):
-        neg = True
-        s = s[1:-1]
-    # 去千分位等字符
-    s = s.replace(",", "").replace("，", "").replace(" ", "")
-    # 特殊破折号/空值
-    if s in {"-", "—", "–", "— —", "--", "N/A", "NA"}:
-        return ""
-
-    try:
-        val = Decimal(s)
-        if neg:
-            val = -val
-        if scale and scale != 1:
-            val = val * scale
-        return float(val)
-    except (InvalidOperation, ValueError):
-        return x  # 非数值，原样返回
-
-def _clean_table_df(df_raw: pd.DataFrame) -> tuple[pd.DataFrame, dict]:
+def _clean_table_df(df_raw: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame, Dict[str, Any], Dict[str, List[str]]]:
     """
     对 Camelot 产出的 DataFrame 做清洗：
       1) 全角/空格统一
       2) 单位/币种检测并"上卷"（记录 meta，并在列名附加 [人民币元]）
       3) 合并多行表头（如"未分配利润(累计亏损)"）
       4) 数值标准化（去千分位、括号负数、按单位缩放）
-    返回 (df_clean, meta)
+    返回 (df_numeric, df_pretty, meta, columns)
     """
-    # 统一字符串
-    df = df_raw.copy()
-    df = df.map(lambda x: _to_halfwidth(x))
-
-    # 1) 单位/币种检测（可能占据第一行）
+    df = df_raw.copy().map(lambda x: _to_halfwidth(x))
+    
     unit_info = _detect_unit_and_currency(df)
     if unit_info:
         rm = unit_info["row_idx"]
-        # 去掉单位行
         df = df.drop(index=rm).reset_index(drop=True)
-
-    # 2) 合并多行表头
+    
     df, hdr_meta = _maybe_merge_multirow_header(df)
-
-    # 3) 列名后缀加单位（上卷到表头）
-    col_suffix = ""
+    
     if unit_info:
         cur = unit_info["currency"] or "CNY"
         unit = unit_info["unit"] or "元"
-        col_suffix = f"[{ '人民币' if cur=='CNY' else cur }{unit}]"
-        # 仅对明显"金额列"追加后缀（含"金额/余额/数/合计/利润/资产/负债"等关键词）
+        col_suffix = f"[{'人民币' if cur=='CNY' else cur}{unit}]"
         new_cols = []
         for c in df.columns:
             c2 = str(c)
@@ -294,63 +317,34 @@ def _clean_table_df(df_raw: pd.DataFrame) -> tuple[pd.DataFrame, dict]:
             else:
                 new_cols.append(c2)
         df.columns = new_cols
-
-    # 4) 数值标准化
     scale = unit_info["scale"] if unit_info else Decimal("1")
-    
-    # 首先识别哪些列主要包含数值数据
-    numeric_columns = set()
-    for col_idx in range(len(df.columns)):
-        col_values = df.iloc[:, col_idx].astype(str).tolist()
-        numeric_count = 0
-        total_non_empty = 0
-        
-        for val in col_values:
-            val_clean = _to_halfwidth(str(val)).strip()
-            if not val_clean or val_clean in {"-", "—", "–", "— —", "--", "N/A", "NA"}:
-                continue
-            total_non_empty += 1
-            # 检查是否包含数字、千分位逗号、括号等数值特征
-            if re.search(r"[0-9\(\),，．.％%]", val_clean):
-                numeric_count += 1
-        
-        # 如果超过50%的非空值包含数值特征，则认为该列为数值列
-        if total_non_empty > 0 and numeric_count / total_non_empty > 0.5:
-            numeric_columns.add(col_idx)
-    
-    def _maybe_numeric(v, col_idx=None):
+    # === 关键改动：data_numeric 用"精确十进制字符串"，不再使用 float ===
+    def _to_numeric_str(v):
         if v is None:
-            return v
-        s = str(v)
-        
-        # 如果该列被识别为数值列，优先尝试数值转换
-        if col_idx is not None and col_idx in numeric_columns:
-            # 对于数值列，即使不包含明显数值特征也尝试转换（可能是空白、文本等）
-            converted = _to_number(s, scale)
-            # 如果转换后不是原字符串，说明成功转换为数值
-            if converted != s:
-                return converted
-            # 否则至少进行半角标准化
-            return _to_halfwidth(s)
-        
-        # 非数值列的原有逻辑：若字符串里含数字或括号/逗号，尝试转数
-        if re.search(r"[0-9\(\),，．.％%]", s):
-            return _to_number(s, scale)
+            return ""
+        s = str(v).strip()
+        # 尝试按精确数字解析（保留原小数位）
+        dec_s = _decimal_str_preserve(s, scale)
+        if dec_s is not None:
+            return dec_s  # 精确十进制字符串（不含千分位）
+        # 非金额文本：规范化文本
         return _to_halfwidth(s)
-
-    # 按列应用数值转换，传入列索引信息
-    for col_idx, col_name in enumerate(df.columns):
-        df[col_name] = df[col_name].apply(lambda x: _maybe_numeric(x, col_idx))
-
+    df_numeric = df.map(_to_numeric_str)
+    # 可读版：基于 numeric 字符串渲染千分位/括号负号
+    df_pretty  = df_numeric.copy().map(_format_pretty)
     meta = {
-        "unit": unit_info["unit"] if unit_info else None,
-        "currency": unit_info["currency"] if unit_info else None,
-        "scale_applied": str(scale) if unit_info else "1",
+        "unit": (unit_info or {}).get("unit"),
+        "currency": (unit_info or {}).get("currency"),
+        "scale_applied": str(scale if unit_info else "1"),
         "header_rows_removed": hdr_meta["header_rows_removed"],
         "merged_header": hdr_meta["merged_header"],
-        "notes": "values normalized: thousands removed, parentheses as negative, full-width normalized",
+        "notes": "numbers kept as exact decimal strings; thousands removed; parentheses→negative; full-width normalized"
     }
-    return df, meta
+    columns = {
+        "normalized": [str(c) for c in df_numeric.columns],
+        "display": [str(c) for c in df.columns]  # 此处保留可能含期间/审计注释的展示名
+    }
+    return df_numeric, df_pretty, meta, columns
 
 # === end of helpers ===========================================================
 
@@ -406,14 +400,14 @@ def _extract_tables(pdf_path: Path) -> List[Dict[str, Any]]:
         for idx, t in enumerate(tl):
             df_raw = t.df
             # ★ 新增：清洗
-            df_clean, meta = _clean_table_df(df_raw)
+            df_numeric, df_pretty, meta, columns = _clean_table_df(df_raw)
             tables.append({
                 "index": idx,
                 "flavor": "lattice",
                 "shape_raw": list(df_raw.shape),
-                "shape_clean": list(df_clean.shape),
+                "shape_clean": list(df_numeric.shape),
                 "raw_json": df_raw.to_json(orient="split", force_ascii=False),
-                "clean_json": df_clean.to_json(orient="split", force_ascii=False),
+                "clean_json": df_numeric.to_json(orient="split", force_ascii=False),
                 "meta": meta,
             })
         return tables
@@ -425,14 +419,14 @@ def _extract_tables(pdf_path: Path) -> List[Dict[str, Any]]:
         for idx, t in enumerate(ts):
             df_raw = t.df
             # ★ 新增：清洗
-            df_clean, meta = _clean_table_df(df_raw)
+            df_numeric, df_pretty, meta, columns = _clean_table_df(df_raw)
             tables.append({
                 "index": idx,
                 "flavor": "stream",
                 "shape_raw": list(df_raw.shape),
-                "shape_clean": list(df_clean.shape),
+                "shape_clean": list(df_numeric.shape),
                 "raw_json": df_raw.to_json(orient="split", force_ascii=False),
-                "clean_json": df_clean.to_json(orient="split", force_ascii=False),
+                "clean_json": df_numeric.to_json(orient="split", force_ascii=False),
                 "meta": meta,
             })
     except Exception:
